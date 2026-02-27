@@ -1,0 +1,408 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <esp_now.h>
+
+#define THIS_NODE 3
+
+#define WIFI_SSID "RAKSHAK_NET3"
+#define WIFI_PASS "12345678"
+#define DNS_PORT 53
+
+#define MAX_USERS 30
+#define MAX_MSG 40
+#define MAX_HOP 5
+#define MAX_MSG_IDS 50
+
+WebServer server(80);
+DNSServer dnsServer;
+
+String NODE_NAME;
+
+/* ================= NODE MACs ================= */
+
+uint8_t node1Mac[] = {0xC8,0x2E,0x18,0xB5,0x69,0xEC};
+uint8_t node2Mac[] = {0x1C,0x69,0x20,0xC6,0xA3,0x2C};
+uint8_t node3Mac[] = {0xFC,0xE8,0xC0,0x74,0x20,0xF0};
+
+/* ================= USERS ================= */
+
+struct LocalUser { String name; };
+LocalUser localUsers[MAX_USERS];
+int localCount = 0;
+
+struct GlobalUser { String name; String node; };
+GlobalUser globalUsers[MAX_USERS];
+int globalCount = 0;
+
+/* ================= MESSAGE STORAGE ================= */
+
+struct Message { String from; String to; String text; };
+
+Message publicHistory[MAX_MSG];
+int publicCount = 0;
+
+Message privateHistory[MAX_MSG];
+int privateCount = 0;
+
+/* ================= DUPLICATE FILTER ================= */
+
+String processedIDs[MAX_MSG_IDS];
+int idIndex = 0;
+
+bool alreadyProcessed(String id){
+  for(int i=0;i<MAX_MSG_IDS;i++){
+    if(processedIDs[i] == id) return true;
+  }
+  return false;
+}
+
+void storeID(String id){
+  processedIDs[idIndex++] = id;
+  if(idIndex >= MAX_MSG_IDS) idIndex = 0;
+}
+
+/* ================= PACKET ================= */
+
+typedef struct {
+  char msgID[30];
+  char from[20];
+  char fromNode[10];
+  char to[20];
+  char toNode[10];
+  char msg[150];
+  char type[15];
+  uint8_t hop;
+} Packet;
+
+Packet incoming;
+
+/* ================= PEERS ================= */
+
+void addPeer(uint8_t *mac){
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+/* ================= USER MANAGEMENT ================= */
+
+void addLocalUser(String name){
+  for(int i=0;i<localCount;i++)
+    if(localUsers[i].name==name) return;
+
+  if(localCount<MAX_USERS)
+    localUsers[localCount++]={name};
+}
+
+void addGlobalUser(String name,String node){
+  for(int i=0;i<globalCount;i++)
+    if(globalUsers[i].name==name) return;
+
+  if(globalCount<MAX_USERS)
+    globalUsers[globalCount++]={name,node};
+}
+
+bool isLocalUser(String name){
+  for(int i=0;i<localCount;i++)
+    if(localUsers[i].name==name) return true;
+  return false;
+}
+
+String findUserNode(String name){
+  for(int i=0;i<globalCount;i++)
+    if(globalUsers[i].name==name)
+      return globalUsers[i].node;
+  return "";
+}
+
+void broadcastUser(String name){
+  Packet pkt;
+  String id = String(millis()) + NODE_NAME;
+  strcpy(pkt.msgID,id.c_str());
+  strcpy(pkt.from,name.c_str());
+  strcpy(pkt.fromNode,NODE_NAME.c_str());
+  strcpy(pkt.type,"USER_SYNC");
+  pkt.hop=0;
+  esp_now_send(NULL,(uint8_t*)&pkt,sizeof(pkt));
+}
+
+/* ================= MESSAGE STORAGE ================= */
+
+void addPublicMessage(String from,String text){
+  if(publicCount>=MAX_MSG) publicCount=0;
+  publicHistory[publicCount++]={from,"PUBLIC",text};
+}
+
+void addPrivateMessage(String from,String to,String text){
+  if(privateCount>=MAX_MSG) privateCount=0;
+  privateHistory[privateCount++]={from,to,text};
+}
+
+/* ================= RECEIVE ================= */
+
+void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int len){
+
+  memcpy(&incoming,data,sizeof(incoming));
+
+  if(alreadyProcessed(incoming.msgID)) return;
+  storeID(incoming.msgID);
+
+  if(incoming.hop>MAX_HOP) return;
+  incoming.hop++;
+
+  String type=incoming.type;
+  String from=incoming.from;
+  String to=incoming.to;
+  String fromNode=incoming.fromNode;
+  String toNode=incoming.toNode;
+  String msg=incoming.msg;
+
+  if(type=="USER_SYNC"){
+    addGlobalUser(from,fromNode);
+    esp_now_send(NULL,(uint8_t*)&incoming,sizeof(incoming));
+  }
+
+  if(type=="PUBLIC"){
+    addPublicMessage(from,msg);
+    esp_now_send(NULL,(uint8_t*)&incoming,sizeof(incoming));
+  }
+
+  if(type=="PRIVATE"){
+
+    if(toNode==NODE_NAME && isLocalUser(to)){
+      addPrivateMessage(from,to,msg);
+    }
+
+    else if(fromNode==NODE_NAME){
+      // already stored
+    }
+
+    else{
+      esp_now_send(NULL,(uint8_t*)&incoming,sizeof(incoming));
+    }
+  }
+}
+
+/* ================= SEND ================= */
+
+void sendPublic(String from,String text){
+
+  Packet pkt;
+  String id = String(millis()) + NODE_NAME;
+
+  strcpy(pkt.msgID,id.c_str());
+  strcpy(pkt.from,from.c_str());
+  strcpy(pkt.fromNode,NODE_NAME.c_str());
+  strcpy(pkt.type,"PUBLIC");
+  strcpy(pkt.msg,text.c_str());
+  pkt.hop=0;
+
+  storeID(id);
+  addPublicMessage(from,text);
+
+  esp_now_send(NULL,(uint8_t*)&pkt,sizeof(pkt));
+}
+
+void sendPrivate(String from,String to,String text){
+
+  String targetNode=findUserNode(to);
+  if(targetNode=="") return;
+
+  Packet pkt;
+  String id = String(millis()) + NODE_NAME;
+
+  strcpy(pkt.msgID,id.c_str());
+  strcpy(pkt.from,from.c_str());
+  strcpy(pkt.fromNode,NODE_NAME.c_str());
+  strcpy(pkt.to,to.c_str());
+  strcpy(pkt.toNode,targetNode.c_str());
+  strcpy(pkt.type,"PRIVATE");
+  strcpy(pkt.msg,text.c_str());
+  pkt.hop=0;
+
+  storeID(id);
+  addPrivateMessage(from,to,text);
+
+  esp_now_send(NULL,(uint8_t*)&pkt,sizeof(pkt));
+}
+
+/* ================= WEB UI ================= */
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rakshak Disaster Network</title>
+<style>
+body{background:#0b0b0b;color:white;font-family:Arial;padding:20px}
+.card{background:#111;border-radius:20px;padding:20px;margin-bottom:25px}
+input,select{width:100%;padding:15px;border-radius:15px;margin-top:15px;border:none}
+button{width:100%;padding:15px;border-radius:15px;background:#d32f2f;color:white;border:none;margin-top:20px;font-size:18px}
+#pub,#priv{background:#000;height:180px;overflow-y:auto;padding:15px;border-radius:15px}
+.node{color:#00e5ff;font-weight:bold}
+</style>
+</head>
+<body>
+
+<h1>🚨 Rakshak Disaster Network</h1>
+<h3>Connected Node: <span class="node">%NODE%</span></h3>
+
+<div class="card">
+<input id="username" placeholder="Enter Your Name">
+<button onclick="join()">Join Network</button>
+</div>
+
+<div class="card">
+<h2>Send Message</h2>
+<select id="target">
+<option value="PUBLIC">📢 Public Broadcast</option>
+</select>
+<input id="message" placeholder="Type message">
+<button onclick="sendMsg()">Send</button>
+</div>
+
+<div class="card">
+<h2>📢 Public Messages</h2>
+<div id="pub">No messages</div>
+</div>
+
+<div class="card">
+<h2>🔒 Private Messages</h2>
+<div id="priv">No messages</div>
+</div>
+
+<script>
+let currentUser="";
+let selectedTarget="PUBLIC";
+
+function join(){
+currentUser=document.getElementById("username").value;
+fetch("/register?name="+encodeURIComponent(currentUser));
+}
+
+function sendMsg(){
+let t=document.getElementById("target").value;
+let m=document.getElementById("message").value;
+if(!currentUser || !m) return;
+
+fetch("/send?from="+encodeURIComponent(currentUser)+"&to="+encodeURIComponent(t)+"&msg="+encodeURIComponent(m));
+document.getElementById("message").value="";
+}
+
+function load(){
+
+let sel=document.getElementById("target");
+selectedTarget=sel.value;
+
+fetch("/users").then(r=>r.json()).then(data=>{
+sel.innerHTML='<option value="PUBLIC">📢 Public Broadcast</option>';
+data.forEach(u=>{
+let o=document.createElement("option");
+o.value=u.name;
+o.text="👤 "+u.name;
+sel.add(o);
+});
+sel.value=selectedTarget;
+});
+
+fetch("/history").then(r=>r.json()).then(data=>{
+document.getElementById("pub").innerHTML=data.public;
+document.getElementById("priv").innerHTML=data.private;
+});
+}
+
+setInterval(load,1500);
+</script>
+</body>
+</html>
+)rawliteral";
+
+/* ================= SETUP ================= */
+
+void setup(){
+
+  Serial.begin(115200);
+
+  if(THIS_NODE==1) NODE_NAME="NODE_1";
+  if(THIS_NODE==2) NODE_NAME="NODE_2";
+  if(THIS_NODE==3) NODE_NAME="NODE_3";
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(WIFI_SSID,WIFI_PASS);
+  dnsServer.start(DNS_PORT,"*",WiFi.softAPIP());
+
+  server.on("/",[](){
+    String page=index_html;
+    page.replace("%NODE%",NODE_NAME);
+    server.send(200,"text/html",page);
+  });
+
+  server.on("/register",[](){
+    String name=server.arg("name");
+    addLocalUser(name);
+    addGlobalUser(name,NODE_NAME);
+    broadcastUser(name);
+    server.send(200,"text/plain","OK");
+  });
+
+  server.on("/send",[](){
+    String from=server.arg("from");
+    String to=server.arg("to");
+    String msg=server.arg("msg");
+
+    if(to=="PUBLIC") sendPublic(from,msg);
+    else sendPrivate(from,to,msg);
+
+    server.send(200,"text/plain","OK");
+  });
+
+  server.on("/history",[](){
+
+    String pub="";
+    for(int i=0;i<publicCount;i++)
+      pub+="<b>"+publicHistory[i].from+"</b>: "+publicHistory[i].text+"<br><hr>";
+
+    String priv="";
+    for(int i=0;i<privateCount;i++)
+      priv+="<b>"+privateHistory[i].from+"</b> ➝ ("+privateHistory[i].to+"): "+privateHistory[i].text+"<br><hr>";
+
+    String json="{\"public\":\""+pub+"\",\"private\":\""+priv+"\"}";
+    server.send(200,"application/json",json);
+  });
+
+  server.on("/users",[](){
+    String json="[";
+    for(int i=0;i<globalCount;i++){
+      json+="{\"name\":\""+globalUsers[i].name+"\"}";
+      if(i<globalCount-1) json+=",";
+    }
+    json+="]";
+    server.send(200,"application/json",json);
+  });
+
+  server.onNotFound([](){
+    String page=index_html;
+    page.replace("%NODE%",NODE_NAME);
+    server.send(200,"text/html",page);
+  });
+
+  server.begin();
+
+  esp_now_init();
+  esp_now_register_recv_cb(onReceive);
+
+  if(THIS_NODE==1){ addPeer(node2Mac); addPeer(node3Mac); }
+  if(THIS_NODE==2){ addPeer(node1Mac); addPeer(node3Mac); }
+  if(THIS_NODE==3){ addPeer(node1Mac); addPeer(node2Mac); }
+
+  Serial.println("RAKSHAK INDUSTRIAL V3 READY");
+}
+
+void loop(){
+  dnsServer.processNextRequest();
+  server.handleClient();
+}
